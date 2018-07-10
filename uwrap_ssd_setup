@@ -1,0 +1,439 @@
+#!/bin/bash
+
+#
+# Copyright (c) 2018 Engineering Design Team (EDT), Inc.
+# All rights reserved.
+#
+# This file is subject to the terms and conditions of the EULA defined at
+# www.edt.com/terms-of-use
+#
+# Technical Contact: <tech@edt.com>
+#
+
+#
+# usage: ./uwrap_ssd_setup
+#
+# Can be run as any user [with sudo access], achieves the same results as root or <user>. 
+# This script is used to locate all NVMe devices on the current system, decide which 
+#   NVMe to use in two linear raids, and create them.
+#
+
+
+# CONSTANT VARIABLES
+#
+NVME_DETECTED=`lspci | grep -i "Non-Volatile memory controller" | wc -l`
+# If you have an NVMe device that is not being recognized add it to the detection by changing the
+#   above statement to the one below; where <other> something unique about your NVMes lspci output.
+# NVME_DETECTED =`lspci | grep -E "Non-Volatile memory controller|<other>" | wc -l`
+
+# DEFAULT VALUES
+#
+blade_index=-1
+nvme_per_blade=()
+
+# GLOBAL VARIABLES
+#
+mock_run=false
+
+# FUNCTIONS
+#
+
+# Purpose: Convert all elements in an array into a string.
+# Usage Example: $(join ' ' ${array[@]}) # seperate by ONE space
+#   $1 - the spacial denominator (sperate array entries by this)
+#   $2 - the actual array
+function join { 
+  local IFS="$1"
+  shift
+  echo "$*" 
+}
+# Purpose: Adds appropriate data entries (3 total) to the mdadm.conf located at $1.
+#   Removing entries containing any/all members of $3.
+#   (In case of mock_run, print the mdadm.conf addition for reference, DO NOT actually add it.)
+# Usage Example: (mdadm_entry $location $md device_list[@])
+#   $1 - full path of the mdmadm.conf file
+#   $2 - the X in /dev/mdX
+#   $3 - the array of devices that will be in the new raid (/dev/nvme*)
+#   $4 - the array of devices that will be in the new raid (uuid)
+function mdadm_entry {
+  list=("${!3}")
+  uuid_list=("${!4}")
+  device_set2=$(join ',' ${uuid_list[@]})
+  device_set=$(join ' ' ${list[@]})
+
+  if [ "$mock_run" = false ]; then
+    for dev in ${list[@]}; do
+      temp=${dev: -9}
+      sudo sed -i "/DEV .*$temp/{N;N;d;}" "$1"
+    done
+
+    echo DEV "$device_set" | sudo tee -a $1
+    echo "ARRAY /dev/md$2 devices=$device_set2" | sudo tee -a $1
+    echo "ARRAY /dev/md$2 level=linear num-devices=${#list[@]} name=$2" | sudo tee -a $1
+  else
+    echo DEV "$device_set"
+    echo "ARRAY /dev/md$2 devices=$device_set2" 
+    echo "ARRAY /dev/md$2 level=linear num-devices=${#list[@]} name=$2"
+  fi
+}
+# Purpose: Remove appropriate data entries from /etc/fstab.
+# Usage Example: (fstab_entry device_list[@])
+#   $1 - the array of devices that will be in the new raid
+function fstab_entry {
+  list=("${!1}")
+  blkid_md_dev=`sudo blkid /dev/md* -s UUID | sed 's/ //'`
+
+  for md_dev in ${blkid_md_dev[@]}; do
+    md=`echo $md_dev | sed 's/:UUID.*//'`
+    md_uuid=`echo $md_dev | sed 's/.*UUID=//; s/"//g'`
+    for dev in ${list[@]}; do
+      in_raid=`sudo mdadm --detail ${md} | grep $dev` &>/dev/null
+      if [[ ! -z "$in_raid" ]]; then
+        sudo sed -i "/^.*$md_uuid.*/d" "/etc/fstab"
+      fi
+    done
+  done
+}
+# Purpose: Displays how to use the script.
+# Usage Example: usage_display
+function usage_display {
+  echo ""
+  echo "Usage: ./uwrap_ssd_setup [--help|-h] [--mock|-m]"
+  echo ""
+  echo "[--help|-h]: Display this usage guide."
+  echo "[--mock|-m]: Fully run the script without any of the following:"
+  echo "  modification of disks (mount, format, partition, mkfs, etc)"
+  echo "  modification of files (mdadm.conf, fstab)"
+  echo "  NOTE: Still need relevant hardware to successfully mock run."
+}
+
+# MAIN
+#
+
+#
+# Evaluate parameters (if mock run is desired) and react with a normal run, mock run, or help.
+#
+while [ ! $# -eq 0 ]; do
+  case "$1" in
+    --help | -h)
+      usage_display
+      exit
+      ;;
+    --mock | -m)
+      mock_run=true
+      ;;
+    --* | -*)
+      echo "Unrecognised flag, please review usage guide."
+      usage_display
+      exit
+      ;;
+  esac
+  shift
+done
+
+`sudo blkid` &>/dev/null
+echo ""
+echo "***************************************************************"
+echo "***   Determining devices on your system; listing below.    ***"
+echo "***************************************************************"
+echo "*** If your device(s) is/are not listed here please contact ***"
+echo "*** Engineering Design Team, Inc. for further instruction.  ***"
+echo "***    contact: edt.com/support                             ***"
+echo "***************************************************************"
+
+#
+# Find available NVMe devices and determine what they are attached too.
+#   Initalizing the blade NVMe counter [nvme_per_blade] to reflect the number
+#   of NVMe devices connected to the given blade [blade_index].
+#
+echo ""
+echo "- - - - - - - - - - - - - NVMe Device - - - - - - - - - - - - -"
+cd /sys/devices/pci0000:00/
+
+full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
+partition_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity|p[0-ff]" | sed 's/.//'))
+
+# Verify that the uuids for the nvme exist if not partition the device to create.
+if [ ${#full_dirs[@]} -ne ${#partition_dirs[@]} ]; then
+  for dir in "${partition_dirs[@]}"; do
+    # Top level plx; has 5 sub-plx switches 3 of which are available for NVMe hookup.
+    temp=${dir%/0000:*/0000:*/*}
+    nvme_name=`echo $dir | cut -d '/' -f 10`
+
+    # Verify uuid available - if not create partition for uuid generation.
+    dev_listing=$(sudo find /dev -print | grep $nvme_name)
+    uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
+    if [ -z "$uuid" ]; then
+      uuid=`sudo blkid $dev_listing -s UUID -o value`
+    fi
+    # The NVMe is new and has no partitions so no uuid.
+    if [ -z "$uuid" ]; then
+      if [ "$mock_run" = false ]; then
+        yes "Yes" | sudo parted $dev_listing mklabel gpt &>/dev/null
+        yes "Yes" | sudo parted $dev_listing mkpart primary 0% 93% &>/dev/null
+        sudo partprobe
+        dev_listing+="p1" 
+        sudo mkfs -t xfs -f $dev_listing &>/dev/null
+      fi
+    fi
+  done
+fi
+
+full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
+plx_dirs=()
+
+for dir in "${full_dirs[@]}"; do
+  # Top level plx; has 5 sub-plx switches 3 of which are available for NVMe hookup.
+  temp=${dir%/0000:*/0000:*/*}
+  nvme_name=`echo $dir | sed 's|^.*/nvme[0-9]n[0-9]/||'`
+  plx_does_have=false
+  for plx_dir in "${plx_dirs[@]}"; do
+    if [ $plx_dir == `pwd`$temp ]; then
+      plx_does_have=true
+      ((nvme_per_blade[$blade_index]++))
+    elif [ -z "$temp" ]; then
+      plx_does_have=true
+    fi
+  done
+  if [ $plx_does_have == false ]; then
+    plx_dirs+=(`pwd`"$temp")
+    ((blade_index++))
+    ((nvme_per_blade[$blade_index]++))
+  fi
+ 
+  dev_listing=($(sudo find /dev -print | grep $nvme_name))
+  uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
+  if [ -z "$uuid" ]; then
+    uuid=`sudo blkid $dev_listing -s UUID -o value`
+  fi
+
+  echo " ---> $dev_listing  ---> uuid:$uuid"
+done
+
+echo ""
+echo "- - - - - - - - - PLX Switch - - - - Blades - - - - - - - - - -"
+
+for dir in "${plx_dirs[@]}"; do
+  echo "$dir"
+done
+
+echo ""
+echo "***************************************************************"
+echo "***     Verifying devices [NVMe and Blades] to be used.     ***"
+echo "***************************************************************"
+echo "*** Selecting devices to be formatted and turned into raid  ***"
+echo "*** device(s), if you have questions or concerns please     ***"
+echo "*** contact Engineering Design Team, Inc. for instruction.  ***"
+echo "***    contact: edt.com/support                             ***"
+echo "***************************************************************"
+
+#
+# Verify the number of blades in the system to be setup [blades] is even [2 | 4].
+#
+echo ""
+blade=${#plx_dirs[@]}
+
+if [ $blade -ne 2 -a $blade -ne 4 ]; then
+  echo "ERROR: an even number of ssd blades is required [ 2 or 4 ]."
+  echo "  *********************************************************"
+  echo "  * If you have more blades containing NVMes installed on *"
+  echo "  * the system than are being displayed, please contact   *"
+  echo "  * Engineering Design Team, Inc.for further instruction. *"
+  echo "  *    contact: edt.com/support                           *"
+  echo "  *********************************************************"
+  exit 1
+fi
+
+#
+# Verify the number of NVMes is even [nvme_ct] and catalog the number of NVMe(s) per given blade 
+#   to be setup [nvme_per_blade].
+#
+nvme_ct=0
+for i in $(eval echo "{1..$blade}"); do
+  finished=0
+  echo "${nvme_per_blade[$i-1]} NVMe devices on ssd blade $i; the blade in the following"
+  echo "pci slot: ${plx_dirs[($i-1)]}"
+  echo ""
+  ((nvme_ct+=${nvme_per_blade[$i-1]}))
+done
+
+temp=$((nvme_ct%2))
+if [ $temp -ne 0 -o $nvme_ct -eq 0 ]; then
+  echo "ERROR: an even number of NVMe ssd drives is required."
+  echo "  *********************************************************"
+  echo "  * If you have more NVMes installed on the system than   *"
+  echo "  * are being displayed, please contact Engineering       *"
+  echo "  * Design Team, Inc.for further instruction.             *"
+  echo "  *    contact: edt.com/support                           *"
+  echo "  *********************************************************"
+  exit 1
+fi
+
+#
+# Decide NVMe partitions, [re-]partition NVMe(s), decide mount point - confirming availablity, create 
+#   new file system, add mount entires to neccessary locations for recognition on boot, and mount.
+#
+half_way=$((nvme_ct/2))
+part_one_dev=()
+part_one_uuid=()
+part_two_dev=()
+part_two_uuid=()
+
+nvme_ct=0
+for dir in "${full_dirs[@]}"; do
+  for plx_dir in "${plx_dirs[@]}"; do 
+    if [[ $dir = *${plx_dir: -10}* ]]; then
+      device=($(sudo find /dev -print | grep ${dir: -9}))
+      device_uuid=`blkid $device -s UUID_SUB -o value`
+      if [ -z "$device_uuid" ]; then
+         device_uuid=`blkid $device -s UUID -o value`
+      fi
+      if [ $nvme_ct -lt $half_way ]; then
+        part_one_dev+=($device)
+        part_one_uuid+=($device_uuid)
+        ((nvme_ct++))
+      else
+        part_two_dev+=($device)
+        part_two_uuid+=($device_uuid)
+        ((nvme_ct++))
+      fi 
+    fi
+  done
+done
+
+# Confirm NVMe to format and [re-]partition in preparation for accepting new file system.
+echo "The following NVMe devices will be used in the creation "
+echo " of linear raid one:"
+for n in $(eval echo "{1..${#part_one_dev[@]}}"); do
+  echo "  ${part_one_dev[$n-1]} ---> uuid:${part_one_uuid[$n-1]}"
+done
+echo " and linear raid two:"
+for n in $(eval echo "{1..${#part_two_dev[@]}}"); do
+  echo "  ${part_two_dev[$n-1]} ---> uuid:${part_two_uuid[$n-1]}"
+done
+echo ""
+echo "This is your final warning, by continuing past this point you"
+echo "are stating that EVERYTHING on the above listed NVMe devices"
+echo "can be PERMANENTLY deleted without issue; a final confirmation"
+echo "is required for this step, please type \"DELETE\" below."
+read a
+if [ "$a" != "DELETE" ]; then
+  echo ""
+  echo "Response was incorrect for continuation, exiting."
+  exit 0
+fi 
+echo ""
+
+dev_list=()
+dev_list_uuid=()
+mount_point="/data"
+for part in {1..2}; do
+  # Differenitate between the two partitions; setting dev_list* and mount_point accordingly.
+  if [ $part -eq 1 ]; then
+    dev_list=("${part_one_dev[@]}")
+    dev_list_uuid=("${part_one_uuid[@]}")
+    mount_point="/data/uwrap0"
+  else
+    dev_list=("${part_two_dev[@]}")
+    dev_list_uuid=("${part_two_uuid[@]}")
+    mount_point="/data/uwrap1"
+  fi
+
+  device_set=$(join ' ' ${dev_list[@]})
+  echo "The following devices will be combined into a 'linear raid'."
+  echo "$device_set"
+  if [ "$mock_run" = false ]; then
+    for dev in "${dev_list[@]}"; do
+      yes "Yes" | sudo parted ${dev:0:12} mklabel gpt &>/dev/null
+      yes "Yes" | sudo parted ${dev:0:12} mkpart primary 0% 93% &>/dev/null
+      sudo partprobe
+    done
+  fi
+
+  # Find the first non-existant /dev/mdX to put the raid on.
+  #   For mock run the $md variable will not change though in the real run it doees.
+  md=0
+  for i in {0..9}; do
+    available=($(sudo find /dev -print | grep "md$i" | wc -l))
+    if [ $available -eq 0 ]; then
+      md=$i
+      break
+    fi
+  done
+  echo ""
+  echo "The 'linear raid' device will be /dev/md$md."
+
+  if [ "$mock_run" = false ]; then
+    # Remove any fstab entry whose device uses the NVMe(s).
+    (fstab_entry dev_list[@])
+
+    # If the NVMe exists in another mdadm array; unmount, stop, and remove the array.
+    for dev in ${dev_list[@]}; do
+      mdX=`grep ${dev:5:7} /proc/mdstat | sed 's/ :.*//'`
+      if [ ! -z $mdX ]; then
+        sudo umount /dev/$mdX &>/dev/null
+        sudo mdadm --stop /dev/$mdX 2>/dev/null
+        sudo mdadm --remove /dev/$mdX &>/dev/null
+      fi
+    done
+  fi 
+
+  # Find appropriate mdadm.conf (or create it) and add the desired array to it.
+  echo "Creating/adding to .../mdadm.conf."
+  location=/etc/mdadm/mdadm.conf
+  if [ ! -d /etc/mdadm ]; then
+    location=/etc/mdadm.conf
+  fi
+  
+  (mdadm_entry $location $md dev_list[@] dev_list_uuid[@])
+  echo "mdadm -C /dev/md$md -l linear -n ${#dev_list[@]} $device_set"
+  if [ "$mock_run" = false ]; then
+    yes | sudo mdadm -C /dev/md$md -l linear -f -n ${#dev_list[@]} $device_set &> /dev/null
+  fi
+  echo ""
+
+  # Determine if mount_point is availabile for use.
+  if [ -d $mount_point ]; then
+    mount_used=`mount | grep "$mount_point"`
+    fstab_used=`cat /etc/fstab | grep "$mount_point"`
+    if [ -z "$mount_used" ] && [ -z "$fstab_used" ]; then
+      echo "\"$mount_point\" already exists, though it is not currently"
+      echo "being used according to 'mount' or 'cat /etc/fstab'."
+      finished=1
+    else
+      echo "\"$mount_point\" already exists and it is being used. Please" 
+      echo "either choose a different mount point or in a new window"
+      echo "save your data then remove this mount point."
+      exit 1
+    fi
+  else
+    if [ "$mock_run" = false ]; then
+      sudo mkdir -p $mount_point
+    fi
+  fi
+  echo ""
+
+  echo "Creating xfs file system on /dev/md$md."
+  if [ "$mock_run" = false ]; then
+    yes | sudo mkfs -t xfs -f /dev/md$md &>/dev/null
+  fi
+  
+  echo ""
+  uuid="<pretend_uuid>"
+  if [ "$mock_run" = false ]; then
+    uuid=`sudo blkid /dev/md$md -s UUID -o value`
+  fi
+  echo "Linear raid created at /dev/md$md. ($uuid)"
+  echo "Adding entry to /etc/fstab."
+  if [ "$mock_run" = false ]; then
+    echo "UUID=$uuid ${mount_point} xfs rw,nofail,auto 0 0" | sudo tee -a /etc/fstab
+  else
+    echo "UUID=$uuid ${mount_point} xfs rw,nofail,auto 0 0" 
+  fi
+
+  echo "Mounting /dev/md$md."
+  if [ "$mock_run" = false ]; then
+    sudo mount UUID=$uuid 
+  fi
+  echo ""
+done
