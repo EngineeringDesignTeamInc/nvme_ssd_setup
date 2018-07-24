@@ -140,44 +140,61 @@ echo "***    contact: edt.com/mako-support                        ***"
 echo "***************************************************************"
 
 #
+# Determine if NVMe devces (on Mako boards) are new or if they have been used before.
+#   If an NVMe is new it will not have partitions so it will not have UUIDs, in this
+#   case, create a 'demo' partition because we need the UUID.
+#   If, on the other hand the NVMe are being reused there will not be a device UUID
+#   but instead partition UUIDs, this is taken care of later so for this case skip
+#   down to the next section.
+#
+echo ""
+cd /sys/devices/pci0000:00/
+
+full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
+partition_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity|p[0-ff]" | sed 's/.//'))
+
+
+# Verify that the uuids for the nvme exist if not partition the device to create.
+if [ ${#full_dirs[@]} -ne ${#partition_dirs[@]} ]; then 
+  for dir in "${partition_dirs[@]}"; do
+    # Top level plx; has 5 sub-plx switches 3 of which are available for NVMe hookup.
+    temp=${dir%/0000:*/0000:*/*}
+    # Select last field in $dir as nvme_name.
+    nvme_name=`echo $dir | rev | cut -d '/' -f 1 | rev`
+    # Verify uuid available - if not create partition for uuid generation.
+    dev_listing_ct=$(sudo find /dev -print | grep $nvme_name | wc -l)
+
+    # If there are no partitions create some basic ones.
+    if [ $dev_listing_ct -eq 1 ]; then
+      dev_listing=$(sudo find /dev -print | grep $nvme_name)
+      uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
+      if [ -z "$uuid" ]; then
+        uuid=`sudo blkid $dev_listing -s UUID -o value`
+      fi
+      # Either the NVMe is new and has no partitions so no uuid. 
+      if [ -z "$uuid" ]; then
+        if [ "$mock_run" = false ]; then
+          yes "Yes" | sudo parted $dev_listing mklabel gpt &>/dev/null
+          yes "Yes" | sudo parted $dev_listing mkpart primary 0% 93% &>/dev/null
+          sudo partprobe
+          dev_listing+="p1"
+          sudo mkfs -t ext4 $dev_listing &>/dev/null
+        fi
+      fi
+    fi
+  done
+fi
+
+#
 # Find available NVMe devices and determine what they are attached too; listing Mako boards.
 #  Initializing the Mako NVMe counter [default_nvme_per_mako] to reflect the number of
 #  NVMe devices connected to the given Mako [mako_index].
 #
-echo ""
+
 echo "- - - - - - - - - - - - - NVMe Device - - - - - - - - - - - - -"
 cd /sys/devices/pci0000:00/
 
-full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integritry" | sed 's/.//'))
-partition_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity|p[0-ff]" | sed 's/.//'))
-
-# Verify that the uuids for the nvme exist if not partition the device to create.
-if [ ${#full_dirs[@]} -ne ${#partition_dirs[@]} ]; then
- for dir in "${partition_dirs[@]}"; do
-   # Top level plx; has 5 sub-plx switches 3 of which are available for NVMe hookup.
-   temp=${dir%/0000:*/0000:*/*}
-   nvme_name=`echo $dir | cut -d '/' -f 10`
- 
-   # Verify uuid available - if not create partition for uuid generation.
-   dev_listing=$(sudo find /dev -print | grep $nvme_name)
-   uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
-   if [ -z "$uuid" ]; then
-     uuid=`sudo blkid $dev_listing -s UUID -o value`
-   fi
-   # The NVMe is new and has no partitions so no uuid.
-   if [ -z "$uuid" ]; then
-     if [ "$mock_run" = false ]; then
-       yes "Yes" | sudo parted $dev_listing mklabel gpt &>/dev/null
-       yes "Yes" | sudo parted $dev_listing mkpart primary 0% 93% &>/dev/null
-       sudo partprobe
-       dev_listing+="p1"
-       sudo mkfs -t ext4 $dev_listing &>/dev/null
-     fi
-   fi
- done
-fi
-
-full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
+full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p1 | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
 plx_dirs=()
 
 mako_index=-1
@@ -185,27 +202,29 @@ for dir in "${full_dirs[@]}"; do
   # Top level plx; has 5 sub-plx switches 4 of which are available for NVMe hookup.
   temp=${dir%/0000:*/0000:*/*}
   nvme_name=`echo $dir | sed 's|^.*/nvme[0-9]n[0-9]/||'`
-  plx_does_have=false
-  for plx_dir in "${plx_dirs[@]}"; do
-    if [ $plx_dir == `pwd`$temp ]; then
-      plx_does_have=true
+  if [[ "$nvme_name" = *"p1" ]];then
+    plx_does_have=false
+    for plx_dir in "${plx_dirs[@]}"; do
+      if [ $plx_dir == `pwd`$temp ]; then
+        plx_does_have=true
+        ((default_nvme_per_mako[$mako_index]++))
+      elif [ -z "$temp" ]; then
+        plx_does_have=true
+      fi
+    done
+    if [ $plx_does_have == false ]; then
+      plx_dirs+=(`pwd`"$temp")
+      ((mako_index++))
       ((default_nvme_per_mako[$mako_index]++))
-    elif [ -z "$temp" ]; then
-      plx_does_have=true
     fi
-  done
-  if [ $plx_does_have == false ]; then
-    plx_dirs+=(`pwd`"$temp")
-    ((mako_index++))
-    ((default_nvme_per_mako[$mako_index]++))
+    dev_listing=($(sudo find /dev -print | grep $nvme_name))
+    echo "$dir"
+    uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
+    if [ -z "$uuid" ]; then
+      uuid=`sudo blkid $dev_listing -s UUID -o value`
+    fi
+    echo " ---> $dev_listing  ---> uuid:$uuid"
   fi
-  dev_listing=($(sudo find /dev -print | grep $nvme_name))
-  echo "$dir"
-  uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
-  if [ -z "$uuid" ]; then
-    uuid=`sudo blkid $dev_listing -s UUID -o value`
-  fi
-  echo " ---> $dev_listing  ---> uuid:$uuid"
 done
 
 echo ""
@@ -344,7 +363,7 @@ for i in $(eval echo "{1..$mako}"); do
         continue
       fi
       if [[ $dir = *${plx_dirs[$i-1]: -10}* ]]; then
-        device=($(sudo find /dev -print | grep ${dir: -9}))
+        device=($(sudo find /dev -print | grep ${dir: -9} | grep "p1"))
         device_uuid=`blkid $device -s UUID_SUB -o value`
         if [ -z "$device_uuid" ]; then
           device_uuid=`blkid $device -s UUID -o value`
@@ -410,8 +429,16 @@ for i in $(eval echo "{1..$mako}"); do
       echo "$device_set"
       if [ "$mock_run" = false ]; then
         for dev in "${dev_list[@]}"; do
-          yes "Yes" | sudo parted ${dev:0:12} mklabel gpt &>/dev/null
-          yes "Yes" | sudo parted ${dev:0:12} mkpart primary 0% 93% &>/dev/null
+          device=`echo $dev | sed 's|p1||'`
+          if [ $(sudo find /dev -print | grep $device | wc -l) -gt 2 ]; then
+            # If there is more than one partition on an NVMe, (i.e. more than one /dev/nvme#n#p#) 
+            #   remove them all.
+            for rm_part in $(sudo parted -s $device print|awk '/^ / {print $1}'); do
+              yes "i" | sudo parted -s $device rm ${rm_part}
+            done
+          fi
+          yes "Yes" | sudo parted $device mklabel gpt &>/dev/null
+          yes "Yes" | sudo parted $device mkpart primary 0% 93% &>/dev/null
           sudo partprobe
         done
       fi
