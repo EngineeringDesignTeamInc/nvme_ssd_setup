@@ -147,12 +147,12 @@ echo "***************************************************************"
 #   but instead partition UUIDs, this is taken care of later so for this case skip
 #   down to the next section.
 #
+
 echo ""
 cd /sys/devices/pci0000:00/
 
 full_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff]p[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity" | sed 's/.//'))
 partition_dirs=($(find . -type d | grep nvme[0-ff]n[0-ff] | grep -vE "power|trace|holders|queue|mq|slave|integrity|p[0-ff]" | sed 's/.//'))
-
 
 # Verify that the uuids for the nvme exist if not partition the device to create.
 if [ ${#full_dirs[@]} -ne ${#partition_dirs[@]} ]; then 
@@ -171,7 +171,7 @@ if [ ${#full_dirs[@]} -ne ${#partition_dirs[@]} ]; then
       if [ -z "$uuid" ]; then
         uuid=`sudo blkid $dev_listing -s UUID -o value`
       fi
-      # Either the NVMe is new and has no partitions so no uuid. 
+      # The NVMe is new and has no partitions so no uuid. 
       if [ -z "$uuid" ]; then
         if [ "$mock_run" = false ]; then
           yes "Yes" | sudo parted $dev_listing mklabel gpt &>/dev/null
@@ -202,29 +202,27 @@ for dir in "${full_dirs[@]}"; do
   # Top level plx; has 5 sub-plx switches 4 of which are available for NVMe hookup.
   temp=${dir%/0000:*/0000:*/*}
   nvme_name=`echo $dir | sed 's|^.*/nvme[0-9]n[0-9]/||'`
-  if [[ "$nvme_name" = *"p1" ]];then
-    plx_does_have=false
-    for plx_dir in "${plx_dirs[@]}"; do
-      if [ $plx_dir == `pwd`$temp ]; then
-        plx_does_have=true
-        ((default_nvme_per_mako[$mako_index]++))
-      elif [ -z "$temp" ]; then
-        plx_does_have=true
-      fi
-    done
-    if [ $plx_does_have == false ]; then
-      plx_dirs+=(`pwd`"$temp")
-      ((mako_index++))
+  plx_does_have=false
+  for plx_dir in "${plx_dirs[@]}"; do
+    if [ $plx_dir == `pwd`$temp ]; then
+      plx_does_have=true
       ((default_nvme_per_mako[$mako_index]++))
+    elif [ -z "$temp" ]; then
+      plx_does_have=true
     fi
-    dev_listing=($(sudo find /dev -print | grep $nvme_name))
-    echo "$dir"
-    uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
-    if [ -z "$uuid" ]; then
-      uuid=`sudo blkid $dev_listing -s UUID -o value`
-    fi
-    echo " ---> $dev_listing  ---> uuid:$uuid"
+  done
+  if [ $plx_does_have == false ]; then
+    plx_dirs+=(`pwd`"$temp")
+    ((mako_index++))
+    ((default_nvme_per_mako[$mako_index]++))
   fi
+  dev_listing=($(sudo find /dev -print | grep $nvme_name))
+  echo "$dir"
+  uuid=`sudo blkid $dev_listing -s UUID_SUB -o value`
+  if [ -z "$uuid" ]; then
+    uuid=`sudo blkid $dev_listing -s UUID -o value`
+  fi
+  echo " ---> $dev_listing  ---> uuid:$uuid"
 done
 
 echo ""
@@ -363,7 +361,7 @@ for i in $(eval echo "{1..$mako}"); do
         continue
       fi
       if [[ $dir = *${plx_dirs[$i-1]: -10}* ]]; then
-        device=($(sudo find /dev -print | grep ${dir: -9} | grep "p1"))
+        device=($(sudo find /dev -print | grep ${dir: -9}))
         device_uuid=`blkid $device -s UUID_SUB -o value`
         if [ -z "$device_uuid" ]; then
           device_uuid=`blkid $device -s UUID -o value`
